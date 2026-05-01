@@ -1,0 +1,197 @@
+// ble — Bluetooth Low Energy scanning for Praia.
+//
+// Phase 1: Linux only, via raw HCI socket (HCI_CHANNEL_USER for exclusivity).
+// Requires root or CAP_NET_RAW. The high-level scan() temporarily powers off
+// bluetoothd's claim on the controller so we can issue legacy LE scan
+// commands without "Command Disallowed" conflicts (BT 5.x controllers are
+// usually in extended-scanning mode under bluetoothd, which makes legacy
+// commands disallowed).
+//
+// Phase 2 (planned): macOS via CoreBluetooth — same scan() API but with
+// reduced surface (anonymized device UUID instead of MAC, no raw AD bytes).
+//
+// Usage:
+//   use "ble"
+//   let devs = ble.scan({duration: 5000, onAdv: lam{ d in
+//       print(d.address, d.rssi, d.name ?? "-")
+//   }})
+
+let _isLinux = sys.platform == "linux"
+
+let _native = nil
+if (_isLinux) {
+    let arch = sys.exec(["uname", "-m"]).stdout.strip()
+    _native = loadNative(path.dirname(sys.currentFile()) + "/plugins/ble-linux-" + arch + ".so")
+}
+
+func _requireLinux(name) {
+    if (!_isLinux) {
+        throw "ble." + name + "(): Phase 1 supports Linux only (macOS via CoreBluetooth is planned)"
+    }
+}
+
+// ── Adapter power management (Linux) ───────────────────────────────────────
+// HCI_CHANNEL_USER (the "exclusive" channel) requires the controller to be
+// released by the kernel — i.e. powered off via the management interface.
+// We toggle it via `bluetoothctl`, recording the previous state so we can
+// restore it. We don't use `btmgmt` because on some systems (e.g. Fedora 10
+// with bluez 5.83) `btmgmt info` hangs indefinitely.
+// On systems without bluetoothctl this becomes the user's responsibility.
+//
+// NOTE: bluetoothctl operates on the "default" controller — for now we don't
+// expose multi-adapter selection; the `adapter` arg goes to the HCI socket
+// bind only. With one controller (the common case) this is fine.
+
+func _powerState() {
+    let r = sys.exec(["bluetoothctl", "--", "show"])
+    if (r.exitCode != 0) { return nil }
+    for (line in r.stdout.split("\n")) {
+        let t = line.strip()
+        if (t.startsWith("Powered:")) {
+            return t.contains("yes")
+        }
+    }
+    return nil
+}
+
+let _adapterTouched = {}  // adapter -> bool (true if we powered it off)
+
+func _powerOffForExclusive(adapter) {
+    let was = _powerState()
+    if (was == nil) { return }  // no bluetoothctl; assume user handled it
+    if (was == true) {
+        let r = sys.exec(["bluetoothctl", "--", "power", "off"])
+        if (r.exitCode != 0) {
+            throw "ble: failed to power off adapter: " + r.stderr.strip()
+        }
+        _adapterTouched[adapter] = true
+    }
+}
+
+func _restorePower(adapter) {
+    if (_adapterTouched.has(adapter)) {
+        // bluetoothctl can briefly return "Busy" right after we close the
+        // exclusive socket; retry a couple of times.
+        for (i in 0..3) {
+            let r = sys.exec(["bluetoothctl", "--", "power", "on"])
+            if (r.exitCode == 0 && !r.stdout.contains("Busy")) { break }
+            time.sleep(0.2)
+        }
+        _adapterTouched.delete(adapter)
+    }
+}
+
+// ── Native passthroughs ────────────────────────────────────────────────────
+
+func open(adapterIndex, opts) {
+    _requireLinux("open")
+    if (adapterIndex == nil) { adapterIndex = 0 }
+    if (opts == nil) { opts = {} }
+    return _native.open(adapterIndex, opts)
+}
+
+func startScan(handle, opts) {
+    _requireLinux("startScan")
+    return opts == nil ? _native.startScan(handle) : _native.startScan(handle, opts)
+}
+
+func nextEvent(handle, timeoutMs) {
+    _requireLinux("nextEvent")
+    return timeoutMs == nil ? _native.nextEvent(handle) : _native.nextEvent(handle, timeoutMs)
+}
+
+func stopScan(handle) {
+    _requireLinux("stopScan")
+    return _native.stopScan(handle)
+}
+
+func close(handle) {
+    _requireLinux("close")
+    return _native.close(handle)
+}
+
+func parseAd(bytes) {
+    _requireLinux("parseAd")
+    return _native.parseAd(bytes)
+}
+
+// ── High-level scan ────────────────────────────────────────────────────────
+// Hops a single scan window for `duration` ms, collecting advertising reports.
+// Returns an array of {address, addressType, rssi, advType, data, timestamp,
+// (parsed AD fields merged in)}.
+//
+// opts:
+//   adapter:    int (default 0, i.e. hci0)
+//   duration:   ms (default 5000)
+//   active:     bool — send scan requests to elicit scan responses (default false)
+//   intervalMs: scan interval (default ~10ms)
+//   windowMs:   scan window (default ~10ms)
+//   filterDup:  bool — let the controller deduplicate (default false; we want
+//               every adv for pentesting — RSSI changes, scan-resp pairing)
+//   dedup:      bool — Praia-side dedup by address (default true)
+//   onAdv:      callback invoked once per advertising report (raw event,
+//               regardless of dedup)
+func scan(opts) {
+    _requireLinux("scan")
+
+    let adapter   = opts?.adapter ?? 0
+    let duration  = opts?.duration ?? 5000
+    let dedup     = opts?.dedup ?? true
+    let onAdv     = opts?.onAdv
+
+    let scanOpts = {}
+    if (opts?.active != nil)     { scanOpts.active = opts.active }
+    if (opts?.intervalMs != nil) { scanOpts.intervalMs = opts.intervalMs }
+    if (opts?.windowMs != nil)   { scanOpts.windowMs = opts.windowMs }
+    if (opts?.filterDup != nil)  { scanOpts.filterDup = opts.filterDup }
+
+    _powerOffForExclusive(adapter)
+    defer _restorePower(adapter)
+
+    let h = open(adapter, {exclusive: true})
+    defer close(h)
+
+    startScan(h, scanOpts)
+    defer stopScan(h)
+
+    let seen = {}
+    let start = time.now()
+
+    while (time.now() - start < duration) {
+        let remaining = duration - (time.now() - start)
+        let slice = remaining < 250 ? remaining : 250
+        let evt = nextEvent(h, slice)
+        if (!evt) { continue }
+
+        // Merge parsed AD fields into the event map.
+        let ad = parseAd(evt.data)
+        for (k in keys(ad)) { evt[k] = ad[k] }
+
+        if (onAdv) { onAdv(evt) }
+
+        if (dedup) {
+            // Keep the most recent observation per address; merge fields
+            // (e.g. scan-rsp often arrives separately and adds `name` or
+            // services that the original ind didn't carry).
+            if (seen.has(evt.address)) {
+                let prev = seen[evt.address]
+                for (k in keys(evt)) {
+                    if (!prev.has(k) || k == "rssi" || k == "timestamp") {
+                        prev[k] = evt[k]
+                    }
+                }
+            } else {
+                seen[evt.address] = evt
+            }
+        } else {
+            seen[str(time.now()) + ":" + evt.address] = evt
+        }
+    }
+
+    return values(seen)
+}
+
+export {
+    open, startScan, nextEvent, stopScan, close, parseAd,
+    scan
+}

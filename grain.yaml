@@ -1,0 +1,7 @@
+name: ble
+version: 0.1.0
+description: BLE scanning and AD-record parsing (Linux raw HCI)
+author: Viggo Lekdorf
+license: MIT
+main: main.praia
+dependencies:
