@@ -124,6 +124,58 @@ func parseAd(bytes) {
     return _native.parseAd(bytes)
 }
 
+// ── GATT (connect / discover / read / write / subscribe) ───────────────────
+// GATT calls don't take an open() session handle — Linux uses BTPROTO_L2CAP
+// directly (independent of any HCI socket), and macOS uses an internal
+// process-wide central manager that caches CBPeripherals seen during scans.
+//
+// Linux note: if you have an exclusive ble.open() handle from low-level
+// scanning, close it before calling connect — HCI_CHANNEL_USER claims the
+// controller and blocks the kernel L2CAP stack. The high-level ble.scan()
+// closes its handle automatically.
+
+func connect(address, opts) {
+    return opts == nil ? _native.connect(address)
+                       : _native.connect(address, opts)
+}
+
+func disconnect(connHandle) {
+    return _native.disconnect(connHandle)
+}
+
+func services(connHandle) {
+    return _native.services(connHandle)
+}
+
+func characteristics(connHandle, startHandle, endHandle) {
+    return _native.characteristics(connHandle, startHandle, endHandle)
+}
+
+func read(connHandle, valueHandle) {
+    return _native.read(connHandle, valueHandle)
+}
+
+func write(connHandle, valueHandle, data, withResponse) {
+    if (withResponse == nil) { withResponse = true }
+    return _native.write(connHandle, valueHandle, data, withResponse)
+}
+
+func subscribe(connHandle, valueHandle, scanEndHandle) {
+    return scanEndHandle == nil
+        ? _native.subscribe(connHandle, valueHandle)
+        : _native.subscribe(connHandle, valueHandle, scanEndHandle)
+}
+
+func unsubscribe(connHandle, cccdHandle) {
+    return _native.unsubscribe(connHandle, cccdHandle)
+}
+
+func nextNotification(connHandle, timeoutMs) {
+    return timeoutMs == nil
+        ? _native.nextNotification(connHandle)
+        : _native.nextNotification(connHandle, timeoutMs)
+}
+
 // ── High-level scan ────────────────────────────────────────────────────────
 // Hops a single scan window for `duration` ms, collecting advertising reports.
 // Returns an array of {address, addressType, rssi, advType, data, timestamp,
@@ -203,5 +255,7 @@ func scan(opts) {
 export {
     capabilities,
     open, startScan, nextEvent, stopScan, close, parseAd,
-    scan
+    scan,
+    connect, disconnect, services, characteristics,
+    read, write, subscribe, unsubscribe, nextNotification
 }

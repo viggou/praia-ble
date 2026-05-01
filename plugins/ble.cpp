@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <fcntl.h>
 #include <poll.h>
 #include <string>
 #include <sys/socket.h>
@@ -319,6 +320,369 @@ static bool readOneEvent(BleHandle& h, int timeoutMs) {
     return true;
 }
 
+// ── GATT over L2CAP/ATT (Phase 3) ──────────────────────────────────────────
+//
+// We bypass libbluetooth and the BlueZ DBus GATT API: open an L2CAP socket on
+// CID 4 (ATT) and speak the ATT protocol directly. This gives us full control
+// (raw PDUs, custom MTU, arbitrary handle reads) which is what pentesting
+// tooling typically wants.
+
+constexpr int BTPROTO_L2CAP        = 0;
+constexpr uint16_t L2CAP_ATT_CID   = 0x0004;
+constexpr uint8_t  BDADDR_LE_PUBLIC = 0x01;
+constexpr uint8_t  BDADDR_LE_RANDOM = 0x02;
+
+struct sockaddr_l2 {
+    sa_family_t l2_family;
+    uint16_t    l2_psm;
+    uint8_t     l2_bdaddr[6];
+    uint16_t    l2_cid;
+    uint8_t     l2_bdaddr_type;
+};
+
+constexpr uint8_t ATT_OP_ERROR_RSP         = 0x01;
+constexpr uint8_t ATT_OP_MTU_REQ           = 0x02;
+constexpr uint8_t ATT_OP_MTU_RSP           = 0x03;
+constexpr uint8_t ATT_OP_FIND_INFO_REQ     = 0x04;
+constexpr uint8_t ATT_OP_FIND_INFO_RSP     = 0x05;
+constexpr uint8_t ATT_OP_READ_BY_TYPE_REQ  = 0x08;
+constexpr uint8_t ATT_OP_READ_BY_TYPE_RSP  = 0x09;
+constexpr uint8_t ATT_OP_READ_REQ          = 0x0A;
+constexpr uint8_t ATT_OP_READ_RSP          = 0x0B;
+constexpr uint8_t ATT_OP_READ_BLOB_REQ     = 0x0C;
+constexpr uint8_t ATT_OP_READ_BLOB_RSP     = 0x0D;
+constexpr uint8_t ATT_OP_READ_BY_GROUP_REQ = 0x10;
+constexpr uint8_t ATT_OP_READ_BY_GROUP_RSP = 0x11;
+constexpr uint8_t ATT_OP_WRITE_REQ         = 0x12;
+constexpr uint8_t ATT_OP_WRITE_RSP         = 0x13;
+constexpr uint8_t ATT_OP_HANDLE_NOTIFY     = 0x1B;
+constexpr uint8_t ATT_OP_HANDLE_INDICATE   = 0x1D;
+constexpr uint8_t ATT_OP_HANDLE_CONFIRM    = 0x1E;
+constexpr uint8_t ATT_OP_WRITE_CMD         = 0x52;
+
+constexpr uint8_t ATT_ERR_NOT_FOUND        = 0x0A;
+
+struct AttConn {
+    int sock = -1;
+    uint16_t mtu = 23;
+    // Notifications received while waiting for a request response are buffered
+    // here and consumed by ble.nextNotification.
+    std::deque<std::pair<uint16_t, std::vector<uint8_t>>> notifications;
+};
+
+static std::unordered_map<int64_t, AttConn> attConns;
+static int64_t nextAttId = 1;
+
+// Parse "AA:BB:CC:DD:EE:FF" → 6 little-endian bytes (LSB first, as the kernel
+// expects in sockaddr_l2.l2_bdaddr).
+static bool parseBdaddr(const std::string& s, uint8_t out[6]) {
+    if (s.size() != 17) return false;
+    for (int i = 0; i < 6; i++) {
+        size_t off = static_cast<size_t>(i) * 3;
+        if (off + 2 > s.size()) return false;
+        if (i < 5 && s[off + 2] != ':') return false;
+        auto hex = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        int hi = hex(s[off]);
+        int lo = hex(s[off + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[5 - i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+static void attSend(int sock, const uint8_t* pdu, size_t len) {
+    ssize_t n = write(sock, pdu, len);
+    if (n != static_cast<ssize_t>(len))
+        throw RuntimeError(std::string("ble: ATT write failed: ") + strerror(errno), 0);
+}
+
+// Read one ATT PDU, blocking up to `timeoutMs`. Returns empty on timeout.
+// Honors SIGINT.
+static std::vector<uint8_t> attRecv(AttConn& c, int timeoutMs) {
+    struct pollfd pfd = {c.sock, POLLIN, 0};
+    int pr = poll(&pfd, 1, timeoutMs);
+    checkInterrupted();
+    if (pr < 0) {
+        if (errno == EINTR) return {};
+        throw RuntimeError(std::string("ble: poll: ") + strerror(errno), 0);
+    }
+    if (pr == 0) return {};
+    uint8_t buf[1024];
+    ssize_t n = read(c.sock, buf, sizeof(buf));
+    checkInterrupted();
+    if (n <= 0) {
+        if (n == 0) throw RuntimeError("ble: ATT connection closed by peer", 0);
+        throw RuntimeError(std::string("ble: ATT read: ") + strerror(errno), 0);
+    }
+    return std::vector<uint8_t>(buf, buf + n);
+}
+
+// Send a request and wait for the matching response. Notifications/indications
+// arriving in the meantime are buffered for ble.nextNotification (and indications
+// are auto-confirmed). On Error Response or timeout, throws.
+static std::vector<uint8_t> attRequest(AttConn& c,
+                                       const std::vector<uint8_t>& req,
+                                       int timeoutMs = 5000) {
+    if (req.empty()) throw RuntimeError("ble: empty ATT request", 0);
+    uint8_t expectedRsp = static_cast<uint8_t>(req[0] + 1);
+
+    attSend(c.sock, req.data(), req.size());
+
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeoutMs);
+    while (true) {
+        checkInterrupted();
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0)
+            throw RuntimeError("ble: ATT request timed out", 0);
+
+        auto pdu = attRecv(c, static_cast<int>(std::min<int64_t>(remaining, 200)));
+        if (pdu.empty()) continue;
+        uint8_t op = pdu[0];
+
+        if (op == ATT_OP_HANDLE_NOTIFY && pdu.size() >= 3) {
+            uint16_t vh = static_cast<uint16_t>(pdu[1] | (pdu[2] << 8));
+            c.notifications.emplace_back(
+                vh, std::vector<uint8_t>(pdu.begin() + 3, pdu.end()));
+            continue;
+        }
+        if (op == ATT_OP_HANDLE_INDICATE && pdu.size() >= 3) {
+            uint8_t conf = ATT_OP_HANDLE_CONFIRM;
+            attSend(c.sock, &conf, 1);
+            uint16_t vh = static_cast<uint16_t>(pdu[1] | (pdu[2] << 8));
+            c.notifications.emplace_back(
+                vh, std::vector<uint8_t>(pdu.begin() + 3, pdu.end()));
+            continue;
+        }
+        if (op == ATT_OP_ERROR_RSP && pdu.size() >= 5) {
+            uint8_t reqOp   = pdu[1];
+            uint16_t handle = static_cast<uint16_t>(pdu[2] | (pdu[3] << 8));
+            uint8_t errCode = pdu[4];
+            char msg[160];
+            snprintf(msg, sizeof(msg),
+                "ble: ATT error: reqOp=0x%02X handle=0x%04X errCode=0x%02X",
+                reqOp, handle, errCode);
+            throw RuntimeError(msg, 0);
+        }
+        if (op == expectedRsp) return pdu;
+        // Anything else (stray response after a previous timeout, etc.) is
+        // dropped. This is conservative but safe.
+    }
+}
+
+// Negotiate ATT MTU. The peer picks min(its max, ours). Default ATT MTU is 23
+// (3-byte ATT header + 20-byte payload), which is painfully small for many
+// reads. We request 247 (max practical for BLE 4.2+ Data Length Extension).
+static void attExchangeMtu(AttConn& c, uint16_t want) {
+    std::vector<uint8_t> req = {
+        ATT_OP_MTU_REQ,
+        static_cast<uint8_t>(want & 0xFF),
+        static_cast<uint8_t>((want >> 8) & 0xFF),
+    };
+    try {
+        auto rsp = attRequest(c, req, 2000);
+        if (rsp.size() >= 3) {
+            uint16_t serverMtu = static_cast<uint16_t>(rsp[1] | (rsp[2] << 8));
+            c.mtu = std::min(want, serverMtu);
+            if (c.mtu < 23) c.mtu = 23;
+        }
+    } catch (...) {
+        // Not all peripherals support Exchange MTU; default 23 is harmless.
+        c.mtu = 23;
+    }
+}
+
+// ── GATT discovery / read / write helpers ─────────────────────────────────
+
+struct GattService {
+    std::string uuid;
+    uint16_t startHandle;
+    uint16_t endHandle;
+};
+
+static std::vector<GattService> gattDiscoverServices(AttConn& c) {
+    std::vector<GattService> out;
+    uint16_t start = 0x0001;
+    while (true) {
+        // Read By Group Type: opcode + start + end + type-uuid (0x2800 = primary svc)
+        std::vector<uint8_t> req = {
+            ATT_OP_READ_BY_GROUP_REQ,
+            static_cast<uint8_t>(start & 0xFF), static_cast<uint8_t>((start >> 8) & 0xFF),
+            0xFF, 0xFF,
+            0x00, 0x28,
+        };
+        try {
+            auto rsp = attRequest(c, req);
+            // Format: 0x11, length(1), [start(2) end(2) uuid(2|16)] * N
+            if (rsp.size() < 2) break;
+            uint8_t entryLen = rsp[1];
+            if (entryLen != 6 && entryLen != 20) break;
+            for (size_t i = 2; i + entryLen <= rsp.size(); i += entryLen) {
+                uint16_t s = static_cast<uint16_t>(rsp[i]   | (rsp[i+1] << 8));
+                uint16_t e = static_cast<uint16_t>(rsp[i+2] | (rsp[i+3] << 8));
+                std::string uuid;
+                if (entryLen == 6) uuid = ble_uuidFromLE(&rsp[i+4], 2);
+                else               uuid = ble_uuidFromLE(&rsp[i+4], 16);
+                out.push_back({std::move(uuid), s, e});
+                if (e == 0xFFFF) return out;
+                start = static_cast<uint16_t>(e + 1);
+            }
+        } catch (RuntimeError& er) {
+            // ATT_ERR_NOT_FOUND (0x0A) means there are no more services.
+            if (std::string(er.what()).find("errCode=0x0A") != std::string::npos)
+                break;
+            throw;
+        }
+    }
+    return out;
+}
+
+struct GattChar {
+    std::string uuid;
+    uint16_t handle;       // declaration handle
+    uint16_t valueHandle;  // value handle
+    uint8_t  props;        // bitmask
+};
+
+static std::vector<GattChar> gattDiscoverChars(AttConn& c, uint16_t startHandle, uint16_t endHandle) {
+    std::vector<GattChar> out;
+    uint16_t start = startHandle;
+    while (start <= endHandle) {
+        // Read By Type with type 0x2803 (Characteristic Declaration)
+        std::vector<uint8_t> req = {
+            ATT_OP_READ_BY_TYPE_REQ,
+            static_cast<uint8_t>(start & 0xFF), static_cast<uint8_t>((start >> 8) & 0xFF),
+            static_cast<uint8_t>(endHandle & 0xFF), static_cast<uint8_t>((endHandle >> 8) & 0xFF),
+            0x03, 0x28,
+        };
+        try {
+            auto rsp = attRequest(c, req);
+            // Format: 0x09, length(1), [handle(2) value(props(1)+valueHandle(2)+uuid(2|16))] * N
+            if (rsp.size() < 2) break;
+            uint8_t entryLen = rsp[1];
+            // entryLen = 2 + 1 + 2 + (2 or 16) = 7 or 21
+            if (entryLen != 7 && entryLen != 21) break;
+            for (size_t i = 2; i + entryLen <= rsp.size(); i += entryLen) {
+                uint16_t handle = static_cast<uint16_t>(rsp[i]   | (rsp[i+1] << 8));
+                uint8_t  props  = rsp[i+2];
+                uint16_t vh     = static_cast<uint16_t>(rsp[i+3] | (rsp[i+4] << 8));
+                std::string uuid;
+                if (entryLen == 7) uuid = ble_uuidFromLE(&rsp[i+5], 2);
+                else               uuid = ble_uuidFromLE(&rsp[i+5], 16);
+                out.push_back({std::move(uuid), handle, vh, props});
+                if (handle == 0xFFFF) return out;
+                start = static_cast<uint16_t>(handle + 1);
+            }
+        } catch (RuntimeError& er) {
+            if (std::string(er.what()).find("errCode=0x0A") != std::string::npos) break;
+            throw;
+        }
+    }
+    return out;
+}
+
+// Read a characteristic value, paginating with Read Blob if the response was
+// exactly mtu-1 bytes (which means there might be more — ATT doesn't tell us
+// the total length, so we have to probe).
+static std::vector<uint8_t> gattReadValue(AttConn& c, uint16_t valueHandle) {
+    std::vector<uint8_t> out;
+    {
+        std::vector<uint8_t> req = {
+            ATT_OP_READ_REQ,
+            static_cast<uint8_t>(valueHandle & 0xFF),
+            static_cast<uint8_t>((valueHandle >> 8) & 0xFF),
+        };
+        auto rsp = attRequest(c, req);
+        out.insert(out.end(), rsp.begin() + 1, rsp.end());
+        if (out.size() < static_cast<size_t>(c.mtu - 1)) return out;
+    }
+    // Long read: keep issuing Read Blob with growing offset until we get
+    // back fewer than mtu-1 bytes (or an error).
+    while (true) {
+        if (out.size() > 0xFFFF) break; // ATT offset is 16-bit
+        uint16_t off = static_cast<uint16_t>(out.size());
+        std::vector<uint8_t> req = {
+            ATT_OP_READ_BLOB_REQ,
+            static_cast<uint8_t>(valueHandle & 0xFF),
+            static_cast<uint8_t>((valueHandle >> 8) & 0xFF),
+            static_cast<uint8_t>(off & 0xFF),
+            static_cast<uint8_t>((off >> 8) & 0xFF),
+        };
+        try {
+            auto rsp = attRequest(c, req);
+            size_t added = rsp.size() - 1;
+            out.insert(out.end(), rsp.begin() + 1, rsp.end());
+            if (added < static_cast<size_t>(c.mtu - 1)) break;
+        } catch (RuntimeError& er) {
+            // 0x07 = Invalid Offset (we read past the end). Stop quietly.
+            if (std::string(er.what()).find("errCode=0x07") != std::string::npos) break;
+            throw;
+        }
+    }
+    return out;
+}
+
+static void gattWriteValue(AttConn& c, uint16_t valueHandle,
+                           const uint8_t* data, size_t len, bool withResponse) {
+    if (len > static_cast<size_t>(c.mtu - 3))
+        throw RuntimeError("ble: write payload exceeds MTU; use a shorter value or "
+                           "negotiate a larger MTU", 0);
+    std::vector<uint8_t> pdu;
+    pdu.reserve(3 + len);
+    pdu.push_back(withResponse ? ATT_OP_WRITE_REQ : ATT_OP_WRITE_CMD);
+    pdu.push_back(static_cast<uint8_t>(valueHandle & 0xFF));
+    pdu.push_back(static_cast<uint8_t>((valueHandle >> 8) & 0xFF));
+    pdu.insert(pdu.end(), data, data + len);
+    if (withResponse) {
+        attRequest(c, pdu);
+    } else {
+        attSend(c.sock, pdu.data(), pdu.size());
+    }
+}
+
+// Locate the CCCD (Client Characteristic Configuration Descriptor, UUID 0x2902)
+// for a characteristic. Walks descriptors via Find Information from
+// valueHandle+1 up to nextValueHandle-1 (or 0xFFFF if not provided).
+static uint16_t gattFindCccd(AttConn& c, uint16_t valueHandle, uint16_t scanEnd = 0xFFFF) {
+    uint16_t start = static_cast<uint16_t>(valueHandle + 1);
+    while (start <= scanEnd) {
+        std::vector<uint8_t> req = {
+            ATT_OP_FIND_INFO_REQ,
+            static_cast<uint8_t>(start & 0xFF), static_cast<uint8_t>((start >> 8) & 0xFF),
+            static_cast<uint8_t>(scanEnd & 0xFF), static_cast<uint8_t>((scanEnd >> 8) & 0xFF),
+        };
+        try {
+            auto rsp = attRequest(c, req);
+            // Format: 0x05, format(1), [handle(2) uuid(2|16)] * N
+            // format=1 → 16-bit UUID; format=2 → 128-bit UUID
+            if (rsp.size() < 2) return 0;
+            uint8_t fmt = rsp[1];
+            size_t entryLen = (fmt == 1) ? 4 : (fmt == 2) ? 18 : 0;
+            if (entryLen == 0) return 0;
+            for (size_t i = 2; i + entryLen <= rsp.size(); i += entryLen) {
+                uint16_t h = static_cast<uint16_t>(rsp[i] | (rsp[i+1] << 8));
+                if (fmt == 1) {
+                    uint16_t uuid16 = static_cast<uint16_t>(rsp[i+2] | (rsp[i+3] << 8));
+                    if (uuid16 == 0x2902) return h;
+                }
+                // 128-bit descriptors are rare for CCCD; we only check 16-bit here.
+                if (h == 0xFFFF) return 0;
+                start = static_cast<uint16_t>(h + 1);
+            }
+        } catch (RuntimeError& er) {
+            if (std::string(er.what()).find("errCode=0x0A") != std::string::npos) return 0;
+            throw;
+        }
+    }
+    return 0;
+}
+
 // ── Plugin registration ────────────────────────────────────────────────────
 
 extern "C" void praia_register(PraiaMap* module) {
@@ -535,6 +899,308 @@ extern "C" void praia_register(PraiaMap* module) {
             m->entries["rawPackets"]    = Value(true);   // adv data exposed as bytes
             m->entries["selectAdapter"] = Value(true);   // multi-adapter via hci index
             m->entries["activeScan"]    = Value(true);   // configurable
+            m->entries["gatt"]          = Value(true);   // raw L2CAP/ATT GATT
             return Value(m);
+        }));
+
+    // ── GATT (Phase 3) ─────────────────────────────────────────────────────
+    // GATT operations don't share state with the scanning side — Linux
+    // uses BTPROTO_L2CAP which is separate from the HCI socket, and macOS
+    // uses a process-wide CoreBluetooth central manager. Connect is called
+    // directly with an address; no session handle needed.
+    //
+    // IMPORTANT: connect() requires the controller to be available to the
+    // kernel BLE stack. If you previously called ble.open() with the default
+    // exclusive=true, close that handle first and restore power (or just use
+    // the high-level ble.scan() which handles this for you).
+
+    // ble.connect(address, opts?) -> connHandle
+    // opts: {addressType: "public"|"random" (default "random"),
+    //        timeoutMs: int (default 10000), mtu: int (default 247)}
+    module->entries["connect"] = Value(makeNative("ble.connect", -1,
+        [](const std::vector<Value>& args) -> Value {
+            if (args.empty() || !args[0].isString())
+                throw RuntimeError("ble.connect(address, opts?) requires address string", 0);
+            const auto& addrStr = args[0].asString();
+            uint8_t bd[6];
+            if (!parseBdaddr(addrStr, bd))
+                throw RuntimeError("ble.connect(): invalid address '" + addrStr + "'", 0);
+
+            uint8_t addrType = BDADDR_LE_RANDOM; // most modern BLE devices
+            int timeoutMs = 10000;
+            // Default MTU 23 (no Exchange MTU): some peripherals disconnect
+            // the link on receiving Exchange MTU. Caller can request a higher
+            // MTU explicitly with opts.mtu (e.g. 247 for BLE 4.2+ DLE).
+            uint16_t wantMtu = 23;
+            if (args.size() > 1 && args[1].isMap()) {
+                auto opts = args[1].asMap();
+                auto get = [&](const char* k) -> const Value* {
+                    auto it = opts->entries.find(Value(std::string(k)));
+                    return it != opts->entries.end() ? &it->second : nullptr;
+                };
+                if (auto v = get("addressType"); v && v->isString()) {
+                    if (v->asString() == "public") addrType = BDADDR_LE_PUBLIC;
+                    else if (v->asString() == "random") addrType = BDADDR_LE_RANDOM;
+                }
+                if (auto v = get("timeoutMs"); v && v->isNumber())
+                    timeoutMs = static_cast<int>(v->asNumber());
+                if (auto v = get("mtu"); v && v->isNumber())
+                    wantMtu = static_cast<uint16_t>(v->asNumber());
+            }
+
+            int sock = socket(AF_BLUETOOTH, SOCK_SEQPACKET | SOCK_CLOEXEC, BTPROTO_L2CAP);
+            if (sock < 0)
+                throw RuntimeError(std::string("ble.connect(): socket: ") + strerror(errno), 0);
+
+            // Bind to "any" local LE address on the controller before connecting.
+            struct sockaddr_l2 src = {};
+            src.l2_family       = AF_BLUETOOTH;
+            src.l2_cid          = L2CAP_ATT_CID;
+            src.l2_bdaddr_type  = BDADDR_LE_PUBLIC; // local addr type
+            if (bind(sock, reinterpret_cast<struct sockaddr*>(&src), sizeof(src)) < 0) {
+                int e = errno; ::close(sock);
+                throw RuntimeError(std::string("ble.connect(): bind: ") + strerror(e), 0);
+            }
+
+            struct sockaddr_l2 dst = {};
+            dst.l2_family      = AF_BLUETOOTH;
+            dst.l2_cid         = L2CAP_ATT_CID;
+            dst.l2_bdaddr_type = addrType;
+            memcpy(dst.l2_bdaddr, bd, 6);
+
+            // Apply timeout via SO_RCVTIMEO so connect() honors it. (BlueZ's
+            // connect() doesn't have its own timeout knob; we wrap with select.)
+            // Easier: use connect() then select for writable, but on
+            // SEQPACKET/L2CAP it's blocking by default. We rely on connect()
+            // returning when L2CAP completes the LE link establishment.
+            // For a hard timeout, do non-blocking connect + poll.
+            int flags = fcntl(sock, F_GETFL, 0);
+            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+            int rc = connect(sock, reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst));
+            if (rc < 0 && errno != EINPROGRESS) {
+                int e = errno; ::close(sock);
+                throw RuntimeError(std::string("ble.connect(): ") + strerror(e), 0);
+            }
+            // Poll for completion in slices so we can honor SIGINT.
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(timeoutMs);
+            while (true) {
+                checkInterrupted();
+                auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()).count();
+                if (remaining <= 0) {
+                    ::close(sock);
+                    throw RuntimeError("ble.connect(): timeout connecting to " + addrStr, 0);
+                }
+                struct pollfd pfd = {sock, POLLOUT, 0};
+                int pr = poll(&pfd, 1, static_cast<int>(std::min<int64_t>(remaining, 200)));
+                if (pr < 0 && errno == EINTR) continue;
+                if (pr < 0) { int e = errno; ::close(sock);
+                    throw RuntimeError(std::string("ble.connect(): poll: ") + strerror(e), 0); }
+                if (pr == 0) continue;
+                int err = 0; socklen_t elen = sizeof(err);
+                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err != 0) {
+                    int e = err ? err : errno; ::close(sock);
+                    throw RuntimeError(std::string("ble.connect(): ") + strerror(e), 0);
+                }
+                break;
+            }
+            fcntl(sock, F_SETFL, flags); // back to blocking
+
+            int64_t id = nextAttId++;
+            AttConn c;
+            c.sock = sock;
+            c.mtu = 23;
+            attConns[id] = std::move(c);
+
+            // Negotiate MTU (best-effort; falls back to 23 if peer rejects).
+            if (wantMtu > 23) attExchangeMtu(attConns[id], wantMtu);
+
+            return Value(id);
+        }));
+
+    // ble.disconnect(connHandle) -> nil
+    module->entries["disconnect"] = Value(makeNative("ble.disconnect", 1,
+        [](const std::vector<Value>& args) -> Value {
+            if (!args[0].isInt()) throw RuntimeError("ble.disconnect() requires conn handle", 0);
+            auto it = attConns.find(args[0].asInt());
+            if (it == attConns.end()) return Value();
+            if (it->second.sock >= 0) ::close(it->second.sock);
+            attConns.erase(it);
+            return Value();
+        }));
+
+    // ble.services(connHandle) -> array of {uuid, startHandle, endHandle}
+    module->entries["services"] = Value(makeNative("ble.services", 1,
+        [](const std::vector<Value>& args) -> Value {
+            if (!args[0].isInt()) throw RuntimeError("ble.services() requires conn handle", 0);
+            auto it = attConns.find(args[0].asInt());
+            if (it == attConns.end()) throw RuntimeError("ble.services(): invalid conn handle", 0);
+            auto svcs = gattDiscoverServices(it->second);
+            auto arr = gcNew<PraiaArray>();
+            for (auto& s : svcs) {
+                auto m = gcNew<PraiaMap>();
+                m->entries["uuid"]        = Value(s.uuid);
+                m->entries["startHandle"] = Value(static_cast<int64_t>(s.startHandle));
+                m->entries["endHandle"]   = Value(static_cast<int64_t>(s.endHandle));
+                arr->elements.push_back(Value(m));
+            }
+            return Value(arr);
+        }));
+
+    // ble.characteristics(connHandle, startHandle, endHandle) -> array of
+    //   {uuid, handle, valueHandle, props: {read, write, writeNoResp, notify, indicate, ...}}
+    module->entries["characteristics"] = Value(makeNative("ble.characteristics", 3,
+        [](const std::vector<Value>& args) -> Value {
+            if (!args[0].isInt() || !args[1].isInt() || !args[2].isInt())
+                throw RuntimeError("ble.characteristics(conn, startHandle, endHandle)", 0);
+            auto it = attConns.find(args[0].asInt());
+            if (it == attConns.end())
+                throw RuntimeError("ble.characteristics(): invalid conn handle", 0);
+            auto chars = gattDiscoverChars(it->second,
+                static_cast<uint16_t>(args[1].asInt()),
+                static_cast<uint16_t>(args[2].asInt()));
+            auto arr = gcNew<PraiaArray>();
+            for (auto& ch : chars) {
+                auto m = gcNew<PraiaMap>();
+                m->entries["uuid"]        = Value(ch.uuid);
+                m->entries["handle"]      = Value(static_cast<int64_t>(ch.handle));
+                m->entries["valueHandle"] = Value(static_cast<int64_t>(ch.valueHandle));
+                auto props = gcNew<PraiaMap>();
+                props->entries["broadcast"]   = Value(static_cast<bool>(ch.props & 0x01));
+                props->entries["read"]        = Value(static_cast<bool>(ch.props & 0x02));
+                props->entries["writeNoResp"] = Value(static_cast<bool>(ch.props & 0x04));
+                props->entries["write"]       = Value(static_cast<bool>(ch.props & 0x08));
+                props->entries["notify"]      = Value(static_cast<bool>(ch.props & 0x10));
+                props->entries["indicate"]    = Value(static_cast<bool>(ch.props & 0x20));
+                props->entries["signedWrite"] = Value(static_cast<bool>(ch.props & 0x40));
+                m->entries["props"] = Value(props);
+                arr->elements.push_back(Value(m));
+            }
+            return Value(arr);
+        }));
+
+    // ble.read(connHandle, valueHandle) -> bytes
+    module->entries["read"] = Value(makeNative("ble.read", 2,
+        [](const std::vector<Value>& args) -> Value {
+            if (!args[0].isInt() || !args[1].isInt())
+                throw RuntimeError("ble.read(conn, valueHandle)", 0);
+            auto it = attConns.find(args[0].asInt());
+            if (it == attConns.end()) throw RuntimeError("ble.read(): invalid conn handle", 0);
+            auto v = gattReadValue(it->second, static_cast<uint16_t>(args[1].asInt()));
+            return Value(std::string(reinterpret_cast<const char*>(v.data()), v.size()));
+        }));
+
+    // ble.write(connHandle, valueHandle, data, withResponse?) -> nil
+    module->entries["write"] = Value(makeNative("ble.write", -1,
+        [](const std::vector<Value>& args) -> Value {
+            if (args.size() < 3 || !args[0].isInt() || !args[1].isInt() || !args[2].isString())
+                throw RuntimeError("ble.write(conn, valueHandle, data, withResponse?)", 0);
+            bool withResp = true;
+            if (args.size() > 3 && args[3].isBool()) withResp = args[3].asBool();
+            auto it = attConns.find(args[0].asInt());
+            if (it == attConns.end()) throw RuntimeError("ble.write(): invalid conn handle", 0);
+            const auto& s = args[2].asString();
+            gattWriteValue(it->second,
+                static_cast<uint16_t>(args[1].asInt()),
+                reinterpret_cast<const uint8_t*>(s.data()), s.size(),
+                withResp);
+            return Value();
+        }));
+
+    // ble.subscribe(connHandle, valueHandle, scanEndHandle?) -> cccdHandle
+    // Walks descriptors to find the CCCD then writes 0x0001 (notifications)
+    // or 0x0002 (indications, picked automatically if the characteristic
+    // doesn't support notify but does support indicate) — but here we only
+    // request notifications. scanEndHandle limits the descriptor walk to a
+    // service's range; if omitted, scans up to 0xFFFF.
+    module->entries["subscribe"] = Value(makeNative("ble.subscribe", -1,
+        [](const std::vector<Value>& args) -> Value {
+            if (args.size() < 2 || !args[0].isInt() || !args[1].isInt())
+                throw RuntimeError("ble.subscribe(conn, valueHandle, scanEndHandle?)", 0);
+            auto it = attConns.find(args[0].asInt());
+            if (it == attConns.end())
+                throw RuntimeError("ble.subscribe(): invalid conn handle", 0);
+            uint16_t vh = static_cast<uint16_t>(args[1].asInt());
+            uint16_t scanEnd = 0xFFFF;
+            if (args.size() > 2 && args[2].isInt())
+                scanEnd = static_cast<uint16_t>(args[2].asInt());
+            uint16_t cccd = gattFindCccd(it->second, vh, scanEnd);
+            if (!cccd)
+                throw RuntimeError("ble.subscribe(): no CCCD descriptor found for handle " +
+                                   std::to_string(vh), 0);
+            uint8_t enable[2] = {0x01, 0x00};
+            gattWriteValue(it->second, cccd, enable, 2, true);
+            return Value(static_cast<int64_t>(cccd));
+        }));
+
+    // ble.unsubscribe(connHandle, cccdHandle) -> nil
+    module->entries["unsubscribe"] = Value(makeNative("ble.unsubscribe", 2,
+        [](const std::vector<Value>& args) -> Value {
+            if (!args[0].isInt() || !args[1].isInt())
+                throw RuntimeError("ble.unsubscribe(conn, cccdHandle)", 0);
+            auto it = attConns.find(args[0].asInt());
+            if (it == attConns.end())
+                throw RuntimeError("ble.unsubscribe(): invalid conn handle", 0);
+            uint8_t disable[2] = {0x00, 0x00};
+            gattWriteValue(it->second, static_cast<uint16_t>(args[1].asInt()),
+                           disable, 2, true);
+            return Value();
+        }));
+
+    // ble.nextNotification(connHandle, timeoutMs?) -> {valueHandle, data} | nil
+    // Returns the next buffered notification, blocking up to timeoutMs (default
+    // 1000) by reading the ATT socket. Throws "Interrupted" on Ctrl+C.
+    module->entries["nextNotification"] = Value(makeNative("ble.nextNotification", -1,
+        [](const std::vector<Value>& args) -> Value {
+            if (args.empty() || !args[0].isInt())
+                throw RuntimeError("ble.nextNotification(conn, timeoutMs?)", 0);
+            auto it = attConns.find(args[0].asInt());
+            if (it == attConns.end())
+                throw RuntimeError("ble.nextNotification(): invalid conn handle", 0);
+            int timeoutMs = 1000;
+            if (args.size() > 1 && args[1].isNumber())
+                timeoutMs = static_cast<int>(args[1].asNumber());
+
+            auto& c = it->second;
+            auto popOne = [&]() -> Value {
+                auto& e = c.notifications.front();
+                auto m = gcNew<PraiaMap>();
+                m->entries["valueHandle"] = Value(static_cast<int64_t>(e.first));
+                m->entries["data"] = Value(std::string(
+                    reinterpret_cast<const char*>(e.second.data()), e.second.size()));
+                c.notifications.pop_front();
+                return Value(m);
+            };
+            if (!c.notifications.empty()) return popOne();
+
+            // No buffered notification — read from the socket until we get one
+            // (auto-confirming any indications) or hit the timeout.
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(timeoutMs);
+            while (true) {
+                checkInterrupted();
+                auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now()).count();
+                if (remaining <= 0) return Value();
+                auto pdu = attRecv(c, static_cast<int>(std::min<int64_t>(remaining, 200)));
+                if (pdu.empty()) continue;
+                uint8_t op = pdu[0];
+                if (op == ATT_OP_HANDLE_NOTIFY && pdu.size() >= 3) {
+                    uint16_t vh = static_cast<uint16_t>(pdu[1] | (pdu[2] << 8));
+                    c.notifications.emplace_back(
+                        vh, std::vector<uint8_t>(pdu.begin() + 3, pdu.end()));
+                    return popOne();
+                }
+                if (op == ATT_OP_HANDLE_INDICATE && pdu.size() >= 3) {
+                    uint8_t conf = ATT_OP_HANDLE_CONFIRM;
+                    attSend(c.sock, &conf, 1);
+                    uint16_t vh = static_cast<uint16_t>(pdu[1] | (pdu[2] << 8));
+                    c.notifications.emplace_back(
+                        vh, std::vector<uint8_t>(pdu.begin() + 3, pdu.end()));
+                    return popOne();
+                }
+                // Other PDUs at this point are stray — drop them.
+            }
         }));
 }
