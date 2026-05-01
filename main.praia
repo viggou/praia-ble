@@ -1,64 +1,74 @@
 // ble — Bluetooth Low Energy scanning for Praia.
 //
-// Phase 1: Linux only, via raw HCI socket (HCI_CHANNEL_USER for exclusivity).
-// Requires root or CAP_NET_RAW. The high-level scan() temporarily powers off
-// bluetoothd's claim on the controller so we can issue legacy LE scan
-// commands without "Command Disallowed" conflicts (BT 5.x controllers are
-// usually in extended-scanning mode under bluetoothd, which makes legacy
-// commands disallowed).
+// Linux:  raw HCI socket via HCI_CHANNEL_USER. Requires root or CAP_NET_RAW.
+//         The high-level scan() temporarily powers off bluetoothd's claim on
+//         the controller so legacy LE scan commands aren't rejected with
+//         "Command Disallowed" by BT 5.x extended-mode controllers.
+// macOS:  CoreBluetooth. The first time, macOS will prompt to grant the
+//         terminal permission to access Bluetooth — accept it.
 //
-// Phase 2 (planned): macOS via CoreBluetooth — same scan() API but with
-// reduced surface (anonymized device UUID instead of MAC, no raw AD bytes).
+// Capability differences (call ble.capabilities() to inspect at runtime):
+//
+//   - On macOS, `address` is an anonymized per-app NSUUID, NOT the device's
+//     real MAC. Apple does not expose MACs to userspace.
+//   - On macOS, `data` (raw advertising bytes) is empty: CoreBluetooth gives
+//     pre-parsed advertisement data only. The same parsed fields (`name`,
+//     `services`, `manufacturerData`, etc.) are available either way.
+//   - On macOS, `advType` is reported as "ind" or "nonconn-ind" based on the
+//     connectable flag; "scan-rsp" never appears as a discrete event because
+//     CoreBluetooth merges scan-response data into the same delegate call.
+//   - On macOS, scan parameters (active vs passive, interval/window) are
+//     not user-configurable; CoreBluetooth manages them internally.
 //
 // Usage:
 //   use "ble"
 //   let devs = ble.scan({duration: 5000, onAdv: lam{ d in
-//       print(d.address, d.rssi, d.name ?? "-")
+//       print(d.address, d.rssi, d?.name ?? "-")
 //   }})
 
-let _isLinux = sys.platform == "linux"
+let _platform = sys.platform
+let _isLinux  = _platform == "linux"
+let _isDarwin = _platform == "darwin"
 
 let _native = nil
 if (_isLinux) {
     let arch = sys.exec(["uname", "-m"]).stdout.strip()
     _native = loadNative(path.dirname(sys.currentFile()) + "/plugins/ble-linux-" + arch + ".so")
-}
-
-func _requireLinux(name) {
-    if (!_isLinux) {
-        throw "ble." + name + "(): Phase 1 supports Linux only (macOS via CoreBluetooth is planned)"
+} else {
+    if (_isDarwin) {
+        _native = loadNative(path.dirname(sys.currentFile()) + "/plugins/ble.dylib")
+    } else {
+        throw "ble: unsupported platform '" + _platform + "' (linux and darwin only)"
     }
 }
 
-// ── Adapter power management (Linux) ───────────────────────────────────────
-// HCI_CHANNEL_USER (the "exclusive" channel) requires the controller to be
-// released by the kernel — i.e. powered off via the management interface.
-// We toggle it via `bluetoothctl`, recording the previous state so we can
-// restore it. We don't use `btmgmt` because on some systems (e.g. Fedora 10
-// with bluez 5.83) `btmgmt info` hangs indefinitely.
-// On systems without bluetoothctl this becomes the user's responsibility.
+// ── Adapter power management (Linux only) ──────────────────────────────────
+// HCI_CHANNEL_USER requires the controller to be released by the kernel,
+// i.e. powered off via the management interface. We toggle via bluetoothctl
+// and remember whether we changed the state so disable() restores cleanly.
 //
-// NOTE: bluetoothctl operates on the "default" controller — for now we don't
-// expose multi-adapter selection; the `adapter` arg goes to the HCI socket
-// bind only. With one controller (the common case) this is fine.
+// We don't use `btmgmt` because on some systems (e.g. Fedora 10 with bluez
+// 5.83) `btmgmt info` hangs indefinitely.
+//
+// On macOS this is a no-op — CoreBluetooth manages the radio itself.
 
 func _powerState() {
+    if (!_isLinux) { return nil }
     let r = sys.exec(["bluetoothctl", "--", "show"])
     if (r.exitCode != 0) { return nil }
     for (line in r.stdout.split("\n")) {
         let t = line.strip()
-        if (t.startsWith("Powered:")) {
-            return t.contains("yes")
-        }
+        if (t.startsWith("Powered:")) { return t.contains("yes") }
     }
     return nil
 }
 
-let _adapterTouched = {}  // adapter -> bool (true if we powered it off)
+let _adapterTouched = {}
 
 func _powerOffForExclusive(adapter) {
+    if (!_isLinux) { return }
     let was = _powerState()
-    if (was == nil) { return }  // no bluetoothctl; assume user handled it
+    if (was == nil) { return }
     if (was == true) {
         let r = sys.exec(["bluetoothctl", "--", "power", "off"])
         if (r.exitCode != 0) {
@@ -69,6 +79,7 @@ func _powerOffForExclusive(adapter) {
 }
 
 func _restorePower(adapter) {
+    if (!_isLinux) { return }
     if (_adapterTouched.has(adapter)) {
         // bluetoothctl can briefly return "Busy" right after we close the
         // exclusive socket; retry a couple of times.
@@ -81,37 +92,35 @@ func _restorePower(adapter) {
     }
 }
 
-// ── Native passthroughs ────────────────────────────────────────────────────
+// ── Native passthroughs (work on both platforms) ───────────────────────────
+
+func capabilities() {
+    return _native.capabilities()
+}
 
 func open(adapterIndex, opts) {
-    _requireLinux("open")
     if (adapterIndex == nil) { adapterIndex = 0 }
     if (opts == nil) { opts = {} }
     return _native.open(adapterIndex, opts)
 }
 
 func startScan(handle, opts) {
-    _requireLinux("startScan")
     return opts == nil ? _native.startScan(handle) : _native.startScan(handle, opts)
 }
 
 func nextEvent(handle, timeoutMs) {
-    _requireLinux("nextEvent")
     return timeoutMs == nil ? _native.nextEvent(handle) : _native.nextEvent(handle, timeoutMs)
 }
 
 func stopScan(handle) {
-    _requireLinux("stopScan")
     return _native.stopScan(handle)
 }
 
 func close(handle) {
-    _requireLinux("close")
     return _native.close(handle)
 }
 
 func parseAd(bytes) {
-    _requireLinux("parseAd")
     return _native.parseAd(bytes)
 }
 
@@ -121,19 +130,16 @@ func parseAd(bytes) {
 // (parsed AD fields merged in)}.
 //
 // opts:
-//   adapter:    int (default 0, i.e. hci0)
+//   adapter:    int (default 0, i.e. hci0). Linux only — ignored on macOS.
 //   duration:   ms (default 5000)
-//   active:     bool — send scan requests to elicit scan responses (default false)
-//   intervalMs: scan interval (default ~10ms)
-//   windowMs:   scan window (default ~10ms)
-//   filterDup:  bool — let the controller deduplicate (default false; we want
-//               every adv for pentesting — RSSI changes, scan-resp pairing)
-//   dedup:      bool — Praia-side dedup by address (default true)
+//   active:     bool — Linux only; sends scan requests to elicit scan responses
+//   intervalMs: scan interval (Linux only; default ~10ms)
+//   windowMs:   scan window   (Linux only; default ~10ms)
+//   filterDup:  bool — let the controller deduplicate. Default false.
+//   dedup:      bool — Praia-side dedup by address. Default true.
 //   onAdv:      callback invoked once per advertising report (raw event,
 //               regardless of dedup)
 func scan(opts) {
-    _requireLinux("scan")
-
     let adapter   = opts?.adapter ?? 0
     let duration  = opts?.duration ?? 5000
     let dedup     = opts?.dedup ?? true
@@ -163,7 +169,10 @@ func scan(opts) {
         let evt = nextEvent(h, slice)
         if (!evt) { continue }
 
-        // Merge parsed AD fields into the event map.
+        // Linux returns raw AD bytes in `evt.data`; merge parsed fields. On
+        // macOS `evt.data` is empty (CB doesn't expose raw bytes) and the
+        // parsed fields are already populated by the native side, so
+        // parseAd("") returns an empty map and the loop is a no-op.
         let ad = parseAd(evt.data)
         for (k in keys(ad)) { evt[k] = ad[k] }
 
@@ -171,8 +180,8 @@ func scan(opts) {
 
         if (dedup) {
             // Keep the most recent observation per address; merge fields
-            // (e.g. scan-rsp often arrives separately and adds `name` or
-            // services that the original ind didn't carry).
+            // (e.g. scan-rsp on Linux often arrives separately and adds
+            // `name` or services that the original ind didn't carry).
             if (seen.has(evt.address)) {
                 let prev = seen[evt.address]
                 for (k in keys(evt)) {
@@ -192,6 +201,7 @@ func scan(opts) {
 }
 
 export {
+    capabilities,
     open, startScan, nextEvent, stopScan, close, parseAd,
     scan
 }
