@@ -441,11 +441,11 @@ forCharacteristic:(CBCharacteristic*)ch
         uint16_t sStart = h;
         h++;
         for (CBCharacteristic* c in s.characteristics) {
-            uint16_t cDecl = h;
-            uint16_t cVal  = static_cast<uint16_t>(h + 1);
-            (void)cDecl;
+            // h is the declaration handle; valueHandle = declaration + 1.
+            // Two-handles-per-char matches the layout the `characteristics`
+            // registration synthesises, so lookups round-trip correctly.
             [charEntries addObject:@{
-                @"valueHandle": @(cVal),
+                @"valueHandle": @(static_cast<uint16_t>(h + 1)),
                 @"char": c,
             }];
             h = static_cast<uint16_t>(h + 2);

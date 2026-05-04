@@ -479,6 +479,10 @@ static std::vector<uint8_t> attRequest(AttConn& c,
 // Negotiate ATT MTU. The peer picks min(its max, ours). Default ATT MTU is 23
 // (3-byte ATT header + 20-byte payload), which is painfully small for many
 // reads. We request 247 (max practical for BLE 4.2+ Data Length Extension).
+//
+// Best-effort: peripherals that don't support Exchange MTU (some flat-out
+// disconnect on receiving it) leave us at the default mtu=23. SIGINT is
+// re-thrown so Ctrl+C still escapes.
 static void attExchangeMtu(AttConn& c, uint16_t want) {
     std::vector<uint8_t> req = {
         ATT_OP_MTU_REQ,
@@ -492,8 +496,8 @@ static void attExchangeMtu(AttConn& c, uint16_t want) {
             c.mtu = std::min(want, serverMtu);
             if (c.mtu < 23) c.mtu = 23;
         }
-    } catch (...) {
-        // Not all peripherals support Exchange MTU; default 23 is harmless.
+    } catch (RuntimeError& e) {
+        if (std::string(e.what()) == "Interrupted") throw;
         c.mtu = 23;
     }
 }
@@ -523,6 +527,7 @@ static std::vector<GattService> gattDiscoverServices(AttConn& c) {
             if (rsp.size() < 2) break;
             uint8_t entryLen = rsp[1];
             if (entryLen != 6 && entryLen != 20) break;
+            uint16_t startBefore = start;
             for (size_t i = 2; i + entryLen <= rsp.size(); i += entryLen) {
                 uint16_t s = static_cast<uint16_t>(rsp[i]   | (rsp[i+1] << 8));
                 uint16_t e = static_cast<uint16_t>(rsp[i+2] | (rsp[i+3] << 8));
@@ -533,6 +538,9 @@ static std::vector<GattService> gattDiscoverServices(AttConn& c) {
                 if (e == 0xFFFF) return out;
                 start = static_cast<uint16_t>(e + 1);
             }
+            // Guard against a peer sending a malformed response that doesn't
+            // advance our cursor — would otherwise spin forever.
+            if (start == startBefore) break;
         } catch (RuntimeError& er) {
             // ATT_ERR_NOT_FOUND (0x0A) means there are no more services.
             if (std::string(er.what()).find("errCode=0x0A") != std::string::npos)
@@ -568,6 +576,7 @@ static std::vector<GattChar> gattDiscoverChars(AttConn& c, uint16_t startHandle,
             uint8_t entryLen = rsp[1];
             // entryLen = 2 + 1 + 2 + (2 or 16) = 7 or 21
             if (entryLen != 7 && entryLen != 21) break;
+            uint16_t startBefore = start;
             for (size_t i = 2; i + entryLen <= rsp.size(); i += entryLen) {
                 uint16_t handle = static_cast<uint16_t>(rsp[i]   | (rsp[i+1] << 8));
                 uint8_t  props  = rsp[i+2];
@@ -579,6 +588,7 @@ static std::vector<GattChar> gattDiscoverChars(AttConn& c, uint16_t startHandle,
                 if (handle == 0xFFFF) return out;
                 start = static_cast<uint16_t>(handle + 1);
             }
+            if (start == startBefore) break; // no-progress guard
         } catch (RuntimeError& er) {
             if (std::string(er.what()).find("errCode=0x0A") != std::string::npos) break;
             throw;
@@ -665,6 +675,7 @@ static uint16_t gattFindCccd(AttConn& c, uint16_t valueHandle, uint16_t scanEnd 
             uint8_t fmt = rsp[1];
             size_t entryLen = (fmt == 1) ? 4 : (fmt == 2) ? 18 : 0;
             if (entryLen == 0) return 0;
+            uint16_t startBefore = start;
             for (size_t i = 2; i + entryLen <= rsp.size(); i += entryLen) {
                 uint16_t h = static_cast<uint16_t>(rsp[i] | (rsp[i+1] << 8));
                 if (fmt == 1) {
@@ -675,6 +686,7 @@ static uint16_t gattFindCccd(AttConn& c, uint16_t valueHandle, uint16_t scanEnd 
                 if (h == 0xFFFF) return 0;
                 start = static_cast<uint16_t>(h + 1);
             }
+            if (start == startBefore) return 0; // no-progress guard
         } catch (RuntimeError& er) {
             if (std::string(er.what()).find("errCode=0x0A") != std::string::npos) return 0;
             throw;
@@ -952,60 +964,59 @@ extern "C" void praia_register(PraiaMap* module) {
             if (sock < 0)
                 throw RuntimeError(std::string("ble.connect(): socket: ") + strerror(errno), 0);
 
-            // Bind to "any" local LE address on the controller before connecting.
-            struct sockaddr_l2 src = {};
-            src.l2_family       = AF_BLUETOOTH;
-            src.l2_cid          = L2CAP_ATT_CID;
-            src.l2_bdaddr_type  = BDADDR_LE_PUBLIC; // local addr type
-            if (bind(sock, reinterpret_cast<struct sockaddr*>(&src), sizeof(src)) < 0) {
-                int e = errno; ::close(sock);
-                throw RuntimeError(std::string("ble.connect(): bind: ") + strerror(e), 0);
-            }
+            // From here until the socket is handed off into attConns, any
+            // exception (including SIGINT via checkInterrupted) must close
+            // the socket — otherwise the fd leaks because Praia never gets
+            // a handle to disconnect.
+            try {
+                // Bind to "any" local LE address on the controller before connecting.
+                struct sockaddr_l2 src = {};
+                src.l2_family       = AF_BLUETOOTH;
+                src.l2_cid          = L2CAP_ATT_CID;
+                src.l2_bdaddr_type  = BDADDR_LE_PUBLIC; // local addr type
+                if (bind(sock, reinterpret_cast<struct sockaddr*>(&src), sizeof(src)) < 0)
+                    throw RuntimeError(std::string("ble.connect(): bind: ") + strerror(errno), 0);
 
-            struct sockaddr_l2 dst = {};
-            dst.l2_family      = AF_BLUETOOTH;
-            dst.l2_cid         = L2CAP_ATT_CID;
-            dst.l2_bdaddr_type = addrType;
-            memcpy(dst.l2_bdaddr, bd, 6);
+                struct sockaddr_l2 dst = {};
+                dst.l2_family      = AF_BLUETOOTH;
+                dst.l2_cid         = L2CAP_ATT_CID;
+                dst.l2_bdaddr_type = addrType;
+                memcpy(dst.l2_bdaddr, bd, 6);
 
-            // Apply timeout via SO_RCVTIMEO so connect() honors it. (BlueZ's
-            // connect() doesn't have its own timeout knob; we wrap with select.)
-            // Easier: use connect() then select for writable, but on
-            // SEQPACKET/L2CAP it's blocking by default. We rely on connect()
-            // returning when L2CAP completes the LE link establishment.
-            // For a hard timeout, do non-blocking connect + poll.
-            int flags = fcntl(sock, F_GETFL, 0);
-            fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-            int rc = connect(sock, reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst));
-            if (rc < 0 && errno != EINPROGRESS) {
-                int e = errno; ::close(sock);
-                throw RuntimeError(std::string("ble.connect(): ") + strerror(e), 0);
-            }
-            // Poll for completion in slices so we can honor SIGINT.
-            auto deadline = std::chrono::steady_clock::now() +
-                            std::chrono::milliseconds(timeoutMs);
-            while (true) {
-                checkInterrupted();
-                auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    deadline - std::chrono::steady_clock::now()).count();
-                if (remaining <= 0) {
-                    ::close(sock);
-                    throw RuntimeError("ble.connect(): timeout connecting to " + addrStr, 0);
+                // Non-blocking connect + poll so we can honor SIGINT and a hard
+                // timeout. (BlueZ's L2CAP socket has no built-in connect timeout.)
+                int flags = fcntl(sock, F_GETFL, 0);
+                fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+                int rc = connect(sock, reinterpret_cast<struct sockaddr*>(&dst), sizeof(dst));
+                if (rc < 0 && errno != EINPROGRESS)
+                    throw RuntimeError(std::string("ble.connect(): ") + strerror(errno), 0);
+
+                auto deadline = std::chrono::steady_clock::now() +
+                                std::chrono::milliseconds(timeoutMs);
+                while (true) {
+                    checkInterrupted();
+                    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()).count();
+                    if (remaining <= 0)
+                        throw RuntimeError("ble.connect(): timeout connecting to " + addrStr, 0);
+                    struct pollfd pfd = {sock, POLLOUT, 0};
+                    int pr = poll(&pfd, 1, static_cast<int>(std::min<int64_t>(remaining, 200)));
+                    if (pr < 0 && errno == EINTR) continue;
+                    if (pr < 0)
+                        throw RuntimeError(std::string("ble.connect(): poll: ") + strerror(errno), 0);
+                    if (pr == 0) continue;
+                    int err = 0; socklen_t elen = sizeof(err);
+                    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err != 0) {
+                        int e = err ? err : errno;
+                        throw RuntimeError(std::string("ble.connect(): ") + strerror(e), 0);
+                    }
+                    break;
                 }
-                struct pollfd pfd = {sock, POLLOUT, 0};
-                int pr = poll(&pfd, 1, static_cast<int>(std::min<int64_t>(remaining, 200)));
-                if (pr < 0 && errno == EINTR) continue;
-                if (pr < 0) { int e = errno; ::close(sock);
-                    throw RuntimeError(std::string("ble.connect(): poll: ") + strerror(e), 0); }
-                if (pr == 0) continue;
-                int err = 0; socklen_t elen = sizeof(err);
-                if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &elen) < 0 || err != 0) {
-                    int e = err ? err : errno; ::close(sock);
-                    throw RuntimeError(std::string("ble.connect(): ") + strerror(e), 0);
-                }
-                break;
+                fcntl(sock, F_SETFL, flags); // back to blocking
+            } catch (...) {
+                ::close(sock);
+                throw;
             }
-            fcntl(sock, F_SETFL, flags); // back to blocking
 
             int64_t id = nextAttId++;
             AttConn c;
@@ -1014,7 +1025,17 @@ extern "C" void praia_register(PraiaMap* module) {
             attConns[id] = std::move(c);
 
             // Negotiate MTU (best-effort; falls back to 23 if peer rejects).
-            if (wantMtu > 23) attExchangeMtu(attConns[id], wantMtu);
+            // attExchangeMtu re-throws on SIGINT, so we have to clean up the
+            // socket ourselves — Praia never got a handle to close.
+            if (wantMtu > 23) {
+                try {
+                    attExchangeMtu(attConns[id], wantMtu);
+                } catch (...) {
+                    ::close(attConns[id].sock);
+                    attConns.erase(id);
+                    throw;
+                }
+            }
 
             return Value(id);
         }));
@@ -1109,10 +1130,9 @@ extern "C" void praia_register(PraiaMap* module) {
         }));
 
     // ble.subscribe(connHandle, valueHandle, scanEndHandle?) -> cccdHandle
-    // Walks descriptors to find the CCCD then writes 0x0001 (notifications)
-    // or 0x0002 (indications, picked automatically if the characteristic
-    // doesn't support notify but does support indicate) — but here we only
-    // request notifications. scanEndHandle limits the descriptor walk to a
+    // Walks descriptors to find the CCCD and writes 0x0001 (enable
+    // notifications). For indications, write 0x0002 to the returned cccdHandle
+    // directly via ble.write. scanEndHandle limits the descriptor walk to a
     // service's range; if omitted, scans up to 0xFFFF.
     module->entries["subscribe"] = Value(makeNative("ble.subscribe", -1,
         [](const std::vector<Value>& args) -> Value {
