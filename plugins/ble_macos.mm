@@ -38,6 +38,10 @@
 #include "signal_state.h"
 #include "ble_parser.h"
 
+PRAIA_DECLARE_ABI();
+PRAIA_PLUGIN_METADATA("ble", "0.2.0",
+                     "Bluetooth Low Energy bindings (macOS CoreBluetooth)");
+
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 
@@ -785,6 +789,34 @@ static std::unordered_map<int64_t, MacGattHandle> gattHandles;
 static int64_t nextId = 1;
 static int64_t nextGattId = 1;
 
+// Process-exit hook — stop scans and release the __bridge_retained
+// scanner / connection ObjC pointers so CoreBluetooth tears down
+// cleanly and the next process doesn't inherit a half-initialised
+// central manager. Releasing the retained reference drops the ARC
+// hold; CoreBluetooth's own callback registrations expire with the
+// scanner.
+extern "C" void praia_at_exit(void) {
+    @autoreleasepool {
+        for (auto& [id, h] : handles) {
+            if (h.scanner) {
+                PraiaBleScanner* s = (__bridge_transfer PraiaBleScanner*)h.scanner;
+                if (h.scanning) [s stopScan];
+                (void)s; // ARC releases at autoreleasepool end
+                h.scanner = nullptr;
+            }
+        }
+        for (auto& [id, g] : gattHandles) {
+            if (g.conn) {
+                PraiaBleConn* c = (__bridge_transfer PraiaBleConn*)g.conn;
+                (void)c;
+                g.conn = nullptr;
+            }
+        }
+    }
+    handles.clear();
+    gattHandles.clear();
+}
+
 // Find a peripheral with the given UUID across all open scanners. Returns
 // (peripheral, scanner) on success, both nil otherwise. Used by ble.connect
 // to bridge between the scan side (which discovered the peripheral) and the
@@ -869,6 +901,12 @@ extern "C" void praia_register(PraiaMap* module) {
                                 std::chrono::milliseconds(timeoutMs);
                 while (true) {
                     checkInterrupted();
+                    // Cooperative cancellation — inside a withCancel
+                    // scope, treat token-cancelled as an early
+                    // timeout so the surrounding loop can poll and
+                    // bail. Symmetric with the SIGINT check above.
+                    auto cancelled = praia::shouldCancel();
+                    if (cancelled && *cancelled) return Value();
                     auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
                         deadline - std::chrono::steady_clock::now()).count();
                     if (rem <= 0) return Value();

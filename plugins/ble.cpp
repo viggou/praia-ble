@@ -10,6 +10,10 @@
 #include "signal_state.h"
 #include "ble_parser.h"
 
+PRAIA_DECLARE_ABI();
+PRAIA_PLUGIN_METADATA("ble", "0.2.0",
+                     "Bluetooth Low Energy bindings (Linux HCI)");
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -124,6 +128,18 @@ struct BleHandle {
 
 static std::unordered_map<int64_t, BleHandle> handles;
 static int64_t nextId = 1;
+
+// Process-exit hook — release HCI sockets so the next process can
+// open the adapter without "device busy". Exclusive (HCI_CHANNEL_USER)
+// handles in particular leave the kernel HCI subsystem holding the
+// adapter; without a close, recovery requires `hciconfig hciN down/up`
+// or a Bluetooth restart.
+extern "C" void praia_at_exit(void) {
+    for (auto& [id, h] : handles) {
+        if (h.sock >= 0) ::close(h.sock);
+    }
+    handles.clear();
+}
 
 // ── HCI command/response ───────────────────────────────────────────────────
 
@@ -845,6 +861,14 @@ extern "C" void praia_register(PraiaMap* module) {
                             std::chrono::milliseconds(timeoutMs);
             while (true) {
                 checkInterrupted();
+                // Cooperative cancellation — if user wrapped this call
+                // in withCancel and flipped the token, treat it as an
+                // early timeout so the surrounding loop can poll
+                // tok.cancelled() and bail. Mirrors the SIGINT check
+                // (checkInterrupted) without throwing, matching
+                // pcap.next's pattern.
+                auto cancelled = praia::shouldCancel();
+                if (cancelled && *cancelled) return Value();
                 auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
                     deadline - std::chrono::steady_clock::now()).count();
                 if (remaining <= 0) return Value(); // timeout
