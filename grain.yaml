@@ -1,5 +1,5 @@
 name: ble
-version: 1.0.0
+version: 1.0.1
 description: BLE scanning and AD-record parsing (Linux raw HCI)
 author: Viggo Lekdorf
 license: MIT
